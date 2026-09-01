@@ -8,13 +8,20 @@
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   body {
-    margin: 0; padding: 16px 14px 40px;
+    margin: 0; padding: 16px 14px 48px;
     font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     background: #fff; color: #111;
   }
   @media (prefers-color-scheme: dark) { body { background: #0d0d0f; color: #f2f2f4; } }
   h1 { font-size: 18px; margin: 0 0 2px; }
-  .sub { font-size: 12px; opacity: .6; margin-bottom: 14px; }
+  .sub { font-size: 12px; opacity: .6; margin-bottom: 12px; }
+  .status {
+    font-size: 12px; padding: 10px; border-radius: 10px; margin-bottom: 12px;
+    background: rgba(128,128,128,.12); white-space: pre-wrap; word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .status.good { border-left: 3px solid #16a34a; }
+  .status.bad  { border-left: 3px solid #dc2626; }
   .card { border: 1px solid rgba(128,128,128,.28); border-radius: 12px; padding: 12px; margin-bottom: 10px; }
   .card h2 { font-size: 14px; margin: 0 0 4px; }
   .card p { font-size: 12px; opacity: .72; margin: 0 0 10px; }
@@ -32,7 +39,7 @@
   }
   .ok   { border-left: 3px solid #16a34a; }
   .fail { border-left: 3px solid #dc2626; }
-  .bal { font-size: 12px; opacity: .8; margin-bottom: 12px; }
+  .copy { margin-top: 8px; background: #374151; font-size: 12px; padding: 8px; }
   code { font-size: 11px; }
 </style>
 </head>
@@ -41,18 +48,18 @@
 <h1>Mini App allowlist probe</h1>
 <div class="sub">World Chain 480 · research only · tiny amounts</div>
 
-<div class="bal" id="bal">balances: loading…</div>
+<div class="status" id="status">initialising…</div>
 
 <div class="card">
   <h2>T1 · baseline</h2>
-  <p>Calls the <b>allowlisted</b> Router only. Touches nothing else. If this fails, the setup is wrong — stop.</p>
+  <p>Calls the <b>allowlisted</b> Router only. Touches nothing else. If this fails, the setup is wrong — stop, it is not a finding.</p>
   <button data-t="T1">Run T1</button>
   <div class="out" id="o-T1" hidden></div>
 </div>
 
 <div class="card">
   <h2>T2 · internal call to a NON-allowlisted contract</h2>
-  <p>Router → dynamic Curve. <b>No tokens move.</b> This isolates the single most important question: are internal calls checked?</p>
+  <p>Router → dynamic Curve. <b>No tokens move.</b> Isolates the key question: are internal calls checked? <b>If this fails, STOP</b> — it answers the architecture question on its own.</p>
   <button data-t="T2">Run T2</button>
   <div class="out" id="o-T2" hidden></div>
 </div>
@@ -66,37 +73,50 @@
 
 <div class="card">
   <h2>T4b · SELL via standard approve <em>(the key test)</em></h2>
-  <p>approve on the <b>dynamic token</b> → Router → Curve → WLD back. The approve's <code>to</code> is the dynamic token, so this is where the entrypoint rule bites.</p>
+  <p>approve on the <b>dynamic token</b> → Router → Curve → WLD back. The approve's <code>to</code> is the dynamic token, so this is where the entrypoint rule bites. <b>If this passes, we are done.</b></p>
   <button data-t="T4b">Run T4b</button>
   <div class="out" id="o-T4b" hidden></div>
 </div>
 
 <div class="card">
   <h2>T3 · BUY via Permit2</h2>
-  <p>Only needed if T3b failed. WLD is allowlisted, so this should pass if Permit2 works at all.</p>
+  <p>Only if T3b failed. WLD is allowlisted, so this should pass if Permit2 works at all.</p>
   <button data-t="T3" class="secondary">Run T3</button>
   <div class="out" id="o-T3" hidden></div>
 </div>
 
 <div class="card">
   <h2>T4a · SELL via Permit2</h2>
-  <p>Only needed if T4b failed. Uses Permit2 on the <b>dynamic token</b>, which is not in the Permit2 list.</p>
+  <p>Only if T4b failed. Uses Permit2 on the <b>dynamic token</b>, which is not in the Permit2 list.</p>
   <button data-t="T4a" class="secondary">Run T4a</button>
   <div class="out" id="o-T4a" hidden></div>
 </div>
 
 <div class="card">
   <h2>T4c · SELL via EIP-2612 permit</h2>
-  <p>Only needed if T4a and T4b both failed. The dynamic token is touched <b>only internally</b>. Two steps: sign, then send.</p>
+  <p>Only if T4a and T4b both failed. The dynamic token is touched <b>only internally</b>. Two steps: sign, then send.</p>
   <button data-t="T4c" class="secondary">Run T4c</button>
   <div class="out" id="o-T4c" hidden></div>
 </div>
 
 <script type="module">
+// ===========================================================================
+//  MiniKit v2 ONLY.
+//
+//  v2 removed `MiniKit.commandsAsync`. Commands are direct async methods on
+//  MiniKit, they resolve to { executedWith, data }, and - importantly for this
+//  page - they THROW on failure rather than returning a status field. The
+//  thrown error is the actual experimental result, so it is captured in full.
+//
+//  Docs: docs.world.org/mini-apps/quick-start/{init,responses}
+//        docs.world.org/mini-apps/commands/{send-transaction,sign-typed-data}
+// ===========================================================================
 import { MiniKit } from 'https://esm.sh/@worldcoin/minikit-js@2';
 import { ethers } from 'https://esm.sh/ethers@6';
 
-// ---- deployed probe (World Chain mainnet) --------------------------------
+const APP_ID = new URLSearchParams(location.search).get('app_id')
+  || 'app_394d7a09943146392f63878f26e37eb2';
+
 const A = {
   WLD:     '0x2cFc85d8E48F8EAB294be644d9E25C3030863003',
   PERMIT2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
@@ -105,7 +125,7 @@ const A = {
   TOKEN:   '0xcFB8b46c761b865b2874d339141507ebE629671E',  // deliberately NOT allowlisted
 };
 const AMT = ethers.parseUnits('0.05', 18);
-const RPC = 'https://worldchain.drpc.org';
+const RPCS = ['https://worldchain-mainnet.g.alchemy.com/public', 'https://480.rpc.thirdweb.com', 'https://worldchain.drpc.org'];
 
 const IROUTER = new ethers.Interface([
   'function poke()',
@@ -125,94 +145,131 @@ const IPERMIT2 = new ethers.Interface([
   'function approve(address token, address spender, uint160 amount, uint48 expiration)',
 ]);
 
-const provider = new ethers.JsonRpcProvider(RPC, 480, { staticNetwork: true });
-
+const statusEl = document.getElementById('status');
+function setStatus(text, good) {
+  statusEl.textContent = text;
+  statusEl.className = 'status' + (good === true ? ' good' : good === false ? ' bad' : '');
+}
 function show(id, ok, text) {
   const el = document.getElementById('o-' + id);
   el.hidden = false;
   el.className = 'out ' + (ok ? 'ok' : 'fail');
   el.textContent = text;
+  let btn = el.parentElement.querySelector('.copy');
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.className = 'copy';
+    btn.textContent = 'Copy result';
+    btn.onclick = () => navigator.clipboard?.writeText(el.textContent);
+    el.after(btn);
+  }
 }
 
-// MiniKit exposes the address in different places across versions; try all.
-let connected = null;
-function me() {
-  return connected || MiniKit.user?.walletAddress || MiniKit.walletAddress || null;
+/** eth_call with failover; the public endpoints 500 freely. */
+async function call(to, data) {
+  let last;
+  for (const url of RPCS) {
+    try {
+      return await new ethers.JsonRpcProvider(url, 480, { staticNetwork: true }).call({ to, data });
+    } catch (e) { last = e; }
+  }
+  throw last;
 }
 
-/** Ask World App who the user is. Needed before any balance read. */
-async function connect() {
-  if (me()) return me();
-  const nonce = crypto.randomUUID().replace(/-/g, '');
-  const cmd = MiniKit.commandsAsync?.walletAuth || MiniKit.walletAuth;
-  if (!cmd) throw new Error('walletAuth unavailable - is this running inside World App?');
-  const r = await cmd.call(MiniKit.commandsAsync || MiniKit, {
-    nonce,
-    statement: 'Allowlist probe (research). No funds are moved by signing in.',
-  });
-  const p = r?.finalPayload ?? r;
-  if (p?.status === 'error') throw new Error('walletAuth failed: ' + JSON.stringify(p));
-  connected = p?.address || MiniKit.user?.walletAddress || MiniKit.walletAddress;
-  return connected;
+// ---- who is the user? -----------------------------------------------------
+// v2 exposes walletAddress AT INITIALISATION - walletAuth is NOT required just
+// to read it. But World App injects `window.WorldApp` asynchronously, so a
+// single check right after install() can race and produce a false failure.
+function addressNow() {
+  return MiniKit?.user?.walletAddress
+    || window.WorldApp?.wallet_address
+    || null;
+}
+
+async function waitForAddress(ms = 8000) {
+  const started = Date.now();
+  while (Date.now() - started < ms) {
+    const a = addressNow();
+    if (a) return a;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return null;
+}
+
+function insideWorldApp() {
+  if (window.WorldApp) return true;
+  try { return MiniKit.isInstalled(); } catch { return false; }
+}
+
+/** Full dump of a thrown command error - this IS the experimental result. */
+function describeError(e) {
+  const parts = [];
+  parts.push('name    : ' + (e?.name ?? '(none)'));
+  parts.push('message : ' + (e?.message ?? String(e)));
+  for (const k of ['error_code', 'errorCode', 'code', 'details', 'description', 'status', 'version']) {
+    if (e && e[k] !== undefined) parts.push(`${k.padEnd(8)}: ${JSON.stringify(e[k])}`);
+  }
+  const own = {};
+  try { for (const k of Object.getOwnPropertyNames(e || {})) { if (k !== 'stack') own[k] = e[k]; } } catch {}
+  try { parts.push('raw     : ' + JSON.stringify(own)); } catch {}
+  return parts.join('\n');
 }
 
 async function balances() {
-  const who = me();
+  const who = addressNow();
   if (!who) return 'not connected';
-  const w = await provider.call({ to: A.WLD,   data: IERC20.encodeFunctionData('balanceOf', [who]) });
-  const t = await provider.call({ to: A.TOKEN, data: IERC20.encodeFunctionData('balanceOf', [who]) });
-  return `you: ${who.slice(0,8)}…\nWLD ${ethers.formatUnits(w,18)}  |  PROBE ${ethers.formatUnits(t,18)}`;
+  const w = await call(A.WLD, IERC20.encodeFunctionData('balanceOf', [who]));
+  const t = await call(A.TOKEN, IERC20.encodeFunctionData('balanceOf', [who]));
+  return `WLD ${ethers.formatUnits(w, 18)}  |  PROBE ${ethers.formatUnits(t, 18)}`;
 }
 
-async function refresh() {
-  try { document.getElementById('bal').textContent = 'balances: ' + (await balances()); }
-  catch (e) { document.getElementById('bal').textContent = 'balances: ' + e.message; }
+async function refreshStatus(extra = '') {
+  const who = addressNow();
+  let bal = '';
+  try { bal = await balances(); } catch (e) { bal = 'balance read failed: ' + e.message; }
+  setStatus(
+    `inside World App : yes\napp_id           : ${APP_ID}\nwallet           : ${who || '(none)'}\n${bal}${extra ? '\n' + extra : ''}`,
+    true
+  );
 }
 
-// The whole point: capture EXACTLY what World App says, success or failure.
+// ---- the actual probe -----------------------------------------------------
 async function send(id, transactions) {
+  const who = addressNow();
+  if (!who) { show(id, false, 'No wallet address yet. Reopen the mini app.'); return; }
+
   show(id, true, 'sending…');
-  let res;
+  let result;
   try {
-    const fn = MiniKit.commandsAsync?.sendTransaction
-      ? MiniKit.commandsAsync.sendTransaction.bind(MiniKit.commandsAsync)
-      : MiniKit.sendTransaction.bind(MiniKit);
-    res = await fn({ chainId: 480, transactions });
+    // v2: direct method, resolves to { executedWith, data }, THROWS on failure.
+    result = await MiniKit.sendTransaction({ chainId: 480, transactions });
   } catch (e) {
-    show(id, false, 'THREW\n' + (e?.message || String(e)));
-    return;
-  }
-  const p = res?.finalPayload ?? res;
-  const dump = JSON.stringify(p, null, 2);
-
-  if (p?.status === 'error' || p?.error_code) {
-    show(id, false,
-      'FAILED\n' +
-      'error_code : ' + (p.error_code ?? '(none)') + '\n' +
-      'details    : ' + (p.details ?? p.description ?? '(none)') + '\n\n' + dump);
+    show(id, false, 'REJECTED BY WORLD APP\n\n' + describeError(e));
     return;
   }
 
-  const hash = p?.transaction_id || p?.userOpHash || p?.data?.userOpHash;
-  show(id, true, 'ACCEPTED by World App\nuserOpHash/id: ' + hash + '\n\n' + dump + '\n\nwaiting for receipt…');
+  const data = result?.data ?? result;
+  const hash = data?.userOpHash || data?.transaction_id || data?.transactionId;
+  let text = `ACCEPTED\nexecutedWith : ${result?.executedWith ?? '(n/a)'}\nuserOpHash   : ${hash}\n`;
+  try { text += 'raw          : ' + JSON.stringify(data) + '\n'; } catch {}
+  show(id, true, text + '\nwaiting for the transaction hash…');
 
-  // Resolve to a real transaction hash so we can prove it landed.
   for (let i = 0; i < 30; i++) {
     await new Promise(r => setTimeout(r, 2000));
     try {
       const r = await fetch(`https://developer.world.org/api/v2/minikit/userop/${hash}`).then(x => x.json());
       if (r?.status === 'success' && r.transaction_hash) {
-        show(id, true, 'MINED\nuserOpHash : ' + hash + '\ntx hash    : ' + r.transaction_hash + '\n\n' + (await balances()));
-        refresh();
+        show(id, true, text + `\nMINED\ntx hash      : ${r.transaction_hash}\n\n${await balances()}`);
+        refreshStatus();
         return;
       }
-      if (r?.status === 'failed') {
-        show(id, false, 'ON-CHAIN FAILURE\nuserOpHash : ' + hash + '\n' + JSON.stringify(r, null, 2));
+      if (r?.status === 'failed' || r?.status === 'reverted') {
+        show(id, false, text + '\nON-CHAIN FAILURE\n' + JSON.stringify(r, null, 2));
         return;
       }
     } catch { /* keep polling */ }
   }
-  show(id, true, 'ACCEPTED but receipt not resolved in 60s\nuserOpHash: ' + hash);
+  show(id, true, text + '\nAccepted, but no receipt within 60s. Check the userOpHash.');
 }
 
 const TESTS = {
@@ -242,42 +299,49 @@ const TESTS = {
   ]),
 
   T4c: async () => {
-    const who = me();
-    if (!who) return show('T4c', false, 'not connected');
-    show('T4c', true, 'requesting signature…');
-    const nonceRaw = await provider.call({ to: A.TOKEN, data: IERC20.encodeFunctionData('nonces', [who]) });
-    const nonce = ethers.toBigInt(nonceRaw);
+    const who = addressNow();
+    if (!who) return show('T4c', false, 'No wallet address yet.');
+    show('T4c', true, 'requesting EIP-712 signature…');
+
+    const nonce = ethers.toBigInt(await call(A.TOKEN, IERC20.encodeFunctionData('nonces', [who])));
     const deadline = Math.floor(Date.now() / 1000) + 3600;
 
-    const typed = {
-      types: {
-        Permit: [
-          { name: 'owner',    type: 'address' },
-          { name: 'spender',  type: 'address' },
-          { name: 'value',    type: 'uint256' },
-          { name: 'nonce',    type: 'uint256' },
-          { name: 'deadline', type: 'uint256' },
-        ],
-      },
-      domain: { name: 'ProbeToken', version: '1', chainId: 480, verifyingContract: A.TOKEN },
-      primaryType: 'Permit',
-      message: {
-        owner: who, spender: A.ROUTER,
-        value: AMT.toString(), nonce: nonce.toString(), deadline: String(deadline),
-      },
-    };
-
-    let sig;
+    let signature;
     try {
-      const r = await MiniKit.commandsAsync.signTypedData(typed);
-      const p = r?.finalPayload ?? r;
-      if (p?.status === 'error') return show('T4c', false, 'SIGN FAILED\n' + JSON.stringify(p, null, 2));
-      sig = p.signature;
+      const r = await MiniKit.signTypedData({
+        chainId: 480,
+        primaryType: 'Permit',
+        domain: { name: 'ProbeToken', version: '1', chainId: 480, verifyingContract: A.TOKEN },
+        types: {
+          EIP712Domain: [
+            { name: 'name', type: 'string' },
+            { name: 'version', type: 'string' },
+            { name: 'chainId', type: 'uint256' },
+            { name: 'verifyingContract', type: 'address' },
+          ],
+          Permit: [
+            { name: 'owner', type: 'address' },
+            { name: 'spender', type: 'address' },
+            { name: 'value', type: 'uint256' },
+            { name: 'nonce', type: 'uint256' },
+            { name: 'deadline', type: 'uint256' },
+          ],
+        },
+        message: {
+          owner: who,
+          spender: A.ROUTER,
+          value: AMT.toString(),
+          nonce: nonce.toString(),
+          deadline: String(deadline),
+        },
+      });
+      signature = (r?.data ?? r)?.signature;
     } catch (e) {
-      return show('T4c', false, 'signTypedData threw\n' + (e?.message || String(e)));
+      return show('T4c', false, 'SIGNATURE REJECTED\n\n' + describeError(e));
     }
+    if (!signature) return show('T4c', false, 'no signature returned');
 
-    const { v, r: sr, s: ss } = ethers.Signature.from(sig);
+    const { v, r: sr, s: ss } = ethers.Signature.from(signature);
     return send('T4c', [{
       to: A.ROUTER,
       data: IROUTER.encodeFunctionData('sellViaPermit', [A.CURVE, AMT, deadline, v, sr, ss]),
@@ -289,37 +353,51 @@ document.querySelectorAll('button[data-t]').forEach(b => {
   b.addEventListener('click', async () => {
     b.disabled = true;
     try { await TESTS[b.dataset.t](); }
-    catch (e) { show(b.dataset.t, false, 'ERROR\n' + (e?.message || String(e))); }
+    catch (e) { show(b.dataset.t, false, 'PAGE ERROR (not an allowlist result)\n\n' + describeError(e)); }
     b.disabled = false;
   });
 });
 
-// The app_id can be supplied as ?app_id=app_xxxx so the page never needs
-// redeploying just because the Portal issued a different id.
-const APP_ID = new URLSearchParams(location.search).get('app_id') || undefined;
-
-const status = document.createElement('div');
-status.className = 'bal';
-document.getElementById('bal').before(status);
-
+// ---- boot -----------------------------------------------------------------
 (async () => {
+  let installed;
   try {
-    MiniKit.install(APP_ID);
+    installed = MiniKit.install(APP_ID);
   } catch (e) {
-    status.textContent = 'MiniKit.install failed: ' + e.message;
+    try { installed = MiniKit.install(); } catch (e2) { installed = { success: false, error: e2?.message }; }
   }
-  const inside = (() => { try { return MiniKit.isInstalled(); } catch { return false; } })();
-  status.textContent = inside
-    ? 'running inside World App' + (APP_ID ? ' · app_id ' + APP_ID : ' · no app_id given')
-    : 'NOT running inside World App - open this URL from the Mini App, not a browser';
-  if (!inside) return;
+
+  if (!insideWorldApp()) {
+    setStatus(
+      'NOT running inside World App.\n' +
+      'Open this URL from the Mini App (Developer Portal preview or the app store entry),\n' +
+      'not from a desktop browser.\n\n' +
+      'install() -> ' + JSON.stringify(installed),
+      false
+    );
+    return;
+  }
+
+  // Address is available at init, but WorldApp is injected asynchronously, so
+  // poll rather than checking once. A race here would look like a failure.
+  const who = await waitForAddress();
+  if (who) { await refreshStatus(); return; }
+
+  // Only if the address really is absent, fall back to walletAuth.
+  setStatus('inside World App, no address yet - requesting walletAuth…');
   try {
-    await connect();
-    status.textContent += ' · connected';
+    const r = await MiniKit.walletAuth({
+      nonce: crypto.randomUUID().replace(/-/g, ''),
+      statement: 'Allowlist probe (research). Signing in moves no funds.',
+    });
+    const addr = (r?.data ?? r)?.address;
+    await refreshStatus(addr ? 'walletAuth ok' : 'walletAuth returned no address');
   } catch (e) {
-    status.textContent += ' · connect failed: ' + e.message;
+    setStatus(
+      'inside World App, but could not obtain a wallet address.\n\n' + describeError(e),
+      false
+    );
   }
-  refresh();
 })();
 </script>
 </body>
