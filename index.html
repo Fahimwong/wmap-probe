@@ -360,11 +360,15 @@ document.querySelectorAll('button[data-t]').forEach(b => {
 
 // ---- boot -----------------------------------------------------------------
 (async () => {
+  // install() RETURNS an error object; it does not throw. An earlier version
+  // wrapped it in try/catch with an argument-less retry, and that retry fired
+  // and silently dropped the app id ("App ID not provided during install").
+  // One call, always with the app id, and whatever it returns is shown.
   let installed;
   try {
     installed = MiniKit.install(APP_ID);
   } catch (e) {
-    try { installed = MiniKit.install(); } catch (e2) { installed = { success: false, error: e2?.message }; }
+    installed = { success: false, threw: describeError(e) };
   }
 
   if (!insideWorldApp()) {
@@ -372,10 +376,22 @@ document.querySelectorAll('button[data-t]').forEach(b => {
       'NOT running inside World App.\n' +
       'Open this URL from the Mini App (Developer Portal preview or the app store entry),\n' +
       'not from a desktop browser.\n\n' +
-      'install() -> ' + JSON.stringify(installed),
+      'app_id    : ' + APP_ID + '\n' +
+      'install() : ' + JSON.stringify(installed),
       false
     );
     return;
+  }
+
+  if (installed && installed.success === false) {
+    // Inside World App but install still failed - surface it rather than
+    // letting it masquerade as an allowlist result later.
+    setStatus(
+      'MiniKit.install() reported failure INSIDE World App.\n' +
+      'app_id    : ' + APP_ID + '\n' +
+      'install() : ' + JSON.stringify(installed),
+      false
+    );
   }
 
   // Address is available at init, but WorldApp is injected asynchronously, so
