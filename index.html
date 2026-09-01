@@ -177,13 +177,55 @@ async function call(to, data) {
 }
 
 // ---- who is the user? -----------------------------------------------------
-// v2 exposes walletAddress AT INITIALISATION - walletAuth is NOT required just
-// to read it. But World App injects `window.WorldApp` asynchronously, so a
-// single check right after install() can race and produce a false failure.
+//
+// VERIFIED AGAINST THE PACKAGE SOURCE (minikit-js 2.0.3), because the docs and
+// the real Android behaviour disagree.
+//
+// `MiniKit._user.walletAddress` is assigned in exactly two places:
+//
+//   1. initFromWorldApp()        <- from window.WorldApp.wallet_address
+//   2. updateUserFromWalletAuth() <- called ONLY from the legacy subscribe()
+//                                    wrapper, NOT from the async walletAuth()
+//
+// So when `window.WorldApp.wallet_address` is absent (which is what happens on
+// the Android build we tested), `await MiniKit.walletAuth()` succeeds and
+// `MiniKit.user.walletAddress` STILL stays empty. The address exists only in
+// the command's own return value, documented as `result.data.address`.
+//
+// An earlier version read the address back out of MiniKit state after
+// walletAuth and therefore reported "walletAuth ok" next to "wallet: (none)".
+// The returned address is now captured and held here.
+let authedAddress = null;
+
 function addressNow() {
-  return MiniKit?.user?.walletAddress
+  return authedAddress
+    || MiniKit?.user?.walletAddress
     || window.WorldApp?.wallet_address
     || null;
+}
+
+const isAddress = (a) => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a);
+
+/** Run walletAuth and KEEP the address it returns. */
+async function authenticate() {
+  // Docs: nonce must be alphanumeric, at least 8 characters.
+  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map((b) => b.toString(16).padStart(2, '0')).join('');
+
+  const result = await MiniKit.walletAuth({
+    nonce,
+    statement: 'Allowlist probe (research). Signing in moves no funds.',
+  });
+
+  if (result?.executedWith === 'fallback') {
+    throw new Error('walletAuth ran via the "fallback" path, which returns no address.');
+  }
+  const addr = result?.data?.address;
+  if (!isAddress(addr)) {
+    throw new Error('walletAuth returned no usable address. raw: ' + JSON.stringify(result?.data ?? result));
+  }
+  authedAddress = ethers.getAddress(addr);
+  return authedAddress;
 }
 
 async function waitForAddress(ms = 8000) {
@@ -223,14 +265,41 @@ async function balances() {
   return `WLD ${ethers.formatUnits(w, 18)}  |  PROBE ${ethers.formatUnits(t, 18)}`;
 }
 
+// The page is only "ready" when it can show a real 0x address AND a WLD
+// balance. Anything less is reported as not ready, so a half-working state
+// cannot be mistaken for a usable one.
 async function refreshStatus(extra = '') {
   const who = addressNow();
-  let bal = '';
-  try { bal = await balances(); } catch (e) { bal = 'balance read failed: ' + e.message; }
+  if (!isAddress(who)) {
+    setStatus(
+      `inside World App : yes\napp_id           : ${APP_ID}\nwallet           : (none)\nNOT READY - no wallet address${extra ? '\n' + extra : ''}`,
+      false
+    );
+    return false;
+  }
+
+  let wld, probe;
+  try {
+    wld = ethers.formatUnits(await call(A.WLD, IERC20.encodeFunctionData('balanceOf', [who])), 18);
+    probe = ethers.formatUnits(await call(A.TOKEN, IERC20.encodeFunctionData('balanceOf', [who])), 18);
+  } catch (e) {
+    setStatus(
+      `inside World App : yes\napp_id           : ${APP_ID}\nwallet           : ${who}\nbalance read FAILED: ${e.message}`,
+      false
+    );
+    return false;
+  }
+
   setStatus(
-    `inside World App : yes\napp_id           : ${APP_ID}\nwallet           : ${who || '(none)'}\n${bal}${extra ? '\n' + extra : ''}`,
+    `inside World App : yes\n` +
+    `app_id           : ${APP_ID}\n` +
+    `wallet           : ${who}\n` +
+    `WLD balance      : ${wld}\n` +
+    `PROBE balance    : ${probe}\n` +
+    `READY${extra ? ' - ' + extra : ''}`,
     true
   );
+  return true;
 }
 
 // ---- the actual probe -----------------------------------------------------
@@ -394,23 +463,26 @@ document.querySelectorAll('button[data-t]').forEach(b => {
     );
   }
 
-  // Address is available at init, but WorldApp is injected asynchronously, so
-  // poll rather than checking once. A race here would look like a failure.
-  const who = await waitForAddress();
-  if (who) { await refreshStatus(); return; }
+  // World App injects window.WorldApp asynchronously, so poll briefly before
+  // concluding the address is absent. A race here would look like a failure.
+  const early = await waitForAddress(3000);
+  if (isAddress(early)) {
+    if (await refreshStatus('address available at init')) return;
+  }
 
-  // Only if the address really is absent, fall back to walletAuth.
-  setStatus('inside World App, no address yet - requesting walletAuth…');
+  // Otherwise authenticate and KEEP the returned address (see the note above).
+  setStatus(`inside World App : yes\napp_id           : ${APP_ID}\nrequesting walletAuth…`);
   try {
-    const r = await MiniKit.walletAuth({
-      nonce: crypto.randomUUID().replace(/-/g, ''),
-      statement: 'Allowlist probe (research). Signing in moves no funds.',
-    });
-    const addr = (r?.data ?? r)?.address;
-    await refreshStatus(addr ? 'walletAuth ok' : 'walletAuth returned no address');
+    await authenticate();
+    await refreshStatus('via walletAuth');
   } catch (e) {
     setStatus(
-      'inside World App, but could not obtain a wallet address.\n\n' + describeError(e),
+      'inside World App, but could not obtain a wallet address.\n\n' +
+      'window.WorldApp keys : ' +
+        (window.WorldApp ? Object.keys(window.WorldApp).join(', ') : '(no window.WorldApp)') + '\n' +
+      'wallet_address field : ' + JSON.stringify(window.WorldApp?.wallet_address ?? null) + '\n' +
+      'MiniKit.user         : ' + JSON.stringify(MiniKit?.user ?? null) + '\n\n' +
+      describeError(e),
       false
     );
   }
