@@ -65,38 +65,21 @@
 </div>
 
 <div class="card">
-  <h2>T3b · BUY via standard approve</h2>
-  <p>approve WLD → Router, then Router → dynamic Curve → dynamic Token to you. Spends <b>0.05 WLD</b>.</p>
-  <button data-t="T3b">Run T3b</button>
-  <div class="out" id="o-T3b" hidden></div>
+  <h2>T5 · ERC-1271 signature check <em>(FREE — signs only, sends NO transaction)</em></h2>
+  <p>Asks World App to sign an EIP-712 permit, then checks the signature against your wallet's own
+  <code>isValidSignature</code> with a read-only call. <b>No gas. No WLD. Nothing is broadcast.</b>
+  This decides whether an ERC-1271 permit SELL path is possible at all.</p>
+  <button data-t="T5">Run T5 (free)</button>
+  <div class="out" id="o-T5" hidden></div>
 </div>
 
-<div class="card">
-  <h2>T4b · SELL via standard approve <em>(the key test)</em></h2>
-  <p>approve on the <b>dynamic token</b> → Router → Curve → WLD back. The approve's <code>to</code> is the dynamic token, so this is where the entrypoint rule bites. <b>If this passes, we are done.</b></p>
-  <button data-t="T4b">Run T4b</button>
-  <div class="out" id="o-T4b" hidden></div>
-</div>
-
-<div class="card">
-  <h2>T3 · BUY via Permit2</h2>
-  <p>Only if T3b failed. WLD is allowlisted, so this should pass if Permit2 works at all.</p>
-  <button data-t="T3" class="secondary">Run T3</button>
-  <div class="out" id="o-T3" hidden></div>
-</div>
-
-<div class="card">
-  <h2>T4a · SELL via Permit2</h2>
-  <p>Only if T4b failed. Uses Permit2 on the <b>dynamic token</b>, which is not in the Permit2 list.</p>
-  <button data-t="T4a" class="secondary">Run T4a</button>
-  <div class="out" id="o-T4a" hidden></div>
-</div>
-
-<div class="card">
-  <h2>T4c · SELL via EIP-2612 permit</h2>
-  <p>Only if T4a and T4b both failed. The dynamic token is touched <b>only internally</b>. Two steps: sign, then send.</p>
-  <button data-t="T4c" class="secondary">Run T4c</button>
-  <div class="out" id="o-T4c" hidden></div>
+<div class="card" style="opacity:.55">
+  <h2>Retired tests</h2>
+  <p><b>T3b</b> FAILED (<code>invalid_contract</code>, WLD) — a standard approve is a direct call to the token.<br>
+  <b>T4a</b> FAILED (<code>invalid_token</code>, PROBE) — the Permit2 token list is enforced per token.<br>
+  <b>T4b</b> would fail for the same reason as T3b — <b>do not run it</b>.<br>
+  <b>T4c</b> is broken by design: this ProbeToken uses <code>ecrecover</code>, which can never
+  validate a Safe. Superseded by T5.</p>
 </div>
 
 <script type="module">
@@ -346,41 +329,53 @@ const TESTS = {
 
   T2: () => send('T2', [{ to: A.ROUTER, data: IROUTER.encodeFunctionData('pokeDynamic', [A.CURVE]) }]),
 
-  T3b: () => send('T3b', [
-    { to: A.WLD,    data: IERC20.encodeFunctionData('approve', [A.ROUTER, AMT]) },
-    { to: A.ROUTER, data: IROUTER.encodeFunctionData('buyViaApprove', [A.CURVE, AMT]) },
-  ]),
-
-  // The approve here targets the DYNAMIC TOKEN - that is the variable.
-  T4b: () => send('T4b', [
-    { to: A.TOKEN,  data: IERC20.encodeFunctionData('approve', [A.ROUTER, AMT]) },
-    { to: A.ROUTER, data: IROUTER.encodeFunctionData('sellViaApprove', [A.CURVE, AMT]) },
-  ]),
-
-  T3: () => send('T3', [
-    { to: A.PERMIT2, data: IPERMIT2.encodeFunctionData('approve', [A.WLD, A.ROUTER, AMT, 0]) },
-    { to: A.ROUTER,  data: IROUTER.encodeFunctionData('buyViaPermit2', [A.CURVE, AMT]) },
-  ]),
-
-  T4a: () => send('T4a', [
-    { to: A.PERMIT2, data: IPERMIT2.encodeFunctionData('approve', [A.TOKEN, A.ROUTER, AMT, 0]) },
-    { to: A.ROUTER,  data: IROUTER.encodeFunctionData('sellViaPermit2', [A.CURVE, AMT]) },
-  ]),
-
-  T4c: async () => {
+  // ---- T5: ERC-1271 signature check. Signs only. Sends nothing. ----------
+  //
+  // World App wallets are Gnosis Safe v1.4.1 (verified on-chain). A Safe's
+  // ERC-1271 does NOT validate a raw digest - it wraps it in its own EIP-712
+  // SafeMessage envelope. A fork test against this exact Safe confirmed:
+  //   signature over the RAW digest    -> REJECTED
+  //   signature over the WRAPPED hash  -> ACCEPTED
+  // So the only open question is which one MiniKit produces. This answers it
+  // for free, by asking the wallet itself.
+  T5: async () => {
     const who = addressNow();
-    if (!who) return show('T4c', false, 'No wallet address yet.');
-    show('T4c', true, 'requesting EIP-712 signature…');
+    if (!who) return show('T5', false, 'No wallet address yet.');
 
-    const nonce = ethers.toBigInt(await call(A.TOKEN, IERC20.encodeFunctionData('nonces', [who])));
     const deadline = Math.floor(Date.now() / 1000) + 3600;
-
-    let signature;
+    let nonce;
     try {
-      const r = await MiniKit.signTypedData({
+      nonce = ethers.toBigInt(await call(A.TOKEN, IERC20.encodeFunctionData('nonces', [who])));
+    } catch (e) {
+      return show('T5', false, 'could not read nonce: ' + e.message);
+    }
+
+    // Exactly the permit a real launch token would ask for.
+    const domain = { name: 'ProbeToken', version: '1', chainId: 480, verifyingContract: A.TOKEN };
+    const types = {
+      Permit: [
+        { name: 'owner', type: 'address' },
+        { name: 'spender', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'nonce', type: 'uint256' },
+        { name: 'deadline', type: 'uint256' },
+      ],
+    };
+    const message = {
+      owner: who, spender: A.ROUTER,
+      value: AMT.toString(), nonce: nonce.toString(), deadline: String(deadline),
+    };
+    // The digest an ERC-2612 token would build and hand to SignatureChecker.
+    const digest = ethers.TypedDataEncoder.hash(domain, types, message);
+
+    show('T5', true, 'requesting signature (no transaction will be sent)…');
+
+    let sig, raw;
+    try {
+      raw = await MiniKit.signTypedData({
         chainId: 480,
         primaryType: 'Permit',
-        domain: { name: 'ProbeToken', version: '1', chainId: 480, verifyingContract: A.TOKEN },
+        domain,
         types: {
           EIP712Domain: [
             { name: 'name', type: 'string' },
@@ -388,33 +383,45 @@ const TESTS = {
             { name: 'chainId', type: 'uint256' },
             { name: 'verifyingContract', type: 'address' },
           ],
-          Permit: [
-            { name: 'owner', type: 'address' },
-            { name: 'spender', type: 'address' },
-            { name: 'value', type: 'uint256' },
-            { name: 'nonce', type: 'uint256' },
-            { name: 'deadline', type: 'uint256' },
-          ],
+          ...types,
         },
-        message: {
-          owner: who,
-          spender: A.ROUTER,
-          value: AMT.toString(),
-          nonce: nonce.toString(),
-          deadline: String(deadline),
-        },
+        message,
       });
-      signature = (r?.data ?? r)?.signature;
+      sig = (raw?.data ?? raw)?.signature;
     } catch (e) {
-      return show('T4c', false, 'SIGNATURE REJECTED\n\n' + describeError(e));
+      return show('T5', false, `SIGNING REFUSED\n\n${describeError(e)}`);
     }
-    if (!signature) return show('T4c', false, 'no signature returned');
+    if (!sig) return show('T5', false, `no signature returned\n${JSON.stringify(raw)}`);
 
-    const { v, r: sr, s: ss } = ethers.Signature.from(signature);
-    return send('T4c', [{
-      to: A.ROUTER,
-      data: IROUTER.encodeFunctionData('sellViaPermit', [A.CURVE, AMT, deadline, v, sr, ss]),
-    }]);
+    // Ask the wallet itself whether that signature is valid for this digest.
+    const I1271 = new ethers.Interface(['function isValidSignature(bytes32,bytes) view returns (bytes4)']);
+    let verdict, ret;
+    try {
+      ret = await call(who, I1271.encodeFunctionData('isValidSignature', [digest, sig]));
+      const [magic] = I1271.decodeFunctionResult('isValidSignature', ret);
+      verdict = magic === '0x1626ba7e';
+    } catch (e) {
+      verdict = false;
+      ret = 'reverted: ' + (e.shortMessage || e.message);
+    }
+
+    const verdictText = verdict
+      ? 'PASS - the wallet accepts this signature for this digest.\n' +
+        'An ERC-1271-aware permit SELL path is VIABLE.'
+      : 'FAIL - the wallet does NOT accept it for this digest.\n' +
+        'MiniKit is not producing a Safe-wrapped signature for this envelope.';
+
+    show('T5', verdict, [
+      `wallet    : ${who}`,
+      `digest    : ${digest}`,
+      `signature : ${sig}`,
+      `sig bytes : ${(sig.length - 2) / 2}`,
+      `isValidSignature -> ${ret}`,
+      '',
+      verdictText,
+      '',
+      'NO TRANSACTION WAS SENT. No gas, no WLD.',
+    ].join('\n'));
   },
 };
 
