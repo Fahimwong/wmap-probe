@@ -276,13 +276,40 @@ async function refreshStatus(extra = '') {
     return false;
   }
 
+  // Authoritative capability report. `MiniKit.isCommandAvailable()` cannot be
+  // trusted here: validateCommands() marks a command available even when World
+  // App says it does not support the required version - it only console.warns.
+  // window.WorldApp.supported_commands is the real answer, and reading it costs
+  // nothing: no prompt, no signature, no gas.
+  const W = window.WorldApp || {};
+  const cmds = Array.isArray(W.supported_commands) ? W.supported_commands : [];
+  const find = (n) => cmds.find((c) => c && c.name === n);
+  const fmt = (n) => {
+    const c = find(n);
+    if (!cmds.length) return `${n}: (supported_commands not exposed)`;
+    if (!c) return `${n}: NOT SUPPORTED by this World App build`;
+    const v = Array.isArray(c.supported_versions) ? c.supported_versions.join(',') : '?';
+    return `${n}: versions [${v}]`;
+  };
+
   setStatus(
     `inside World App : yes\n` +
     `app_id           : ${APP_ID}\n` +
     `wallet           : ${who}\n` +
     `WLD balance      : ${wld}\n` +
     `PROBE balance    : ${probe}\n` +
-    `READY${extra ? ' - ' + extra : ''}`,
+    `READY${extra ? ' - ' + extra : ''}\n` +
+    `\n--- World App build ---\n` +
+    `device_os        : ${W.device_os ?? '?'}\n` +
+    `app version      : ${W.world_app_version ?? '?'}\n` +
+    `commands listed  : ${cmds.length}\n` +
+    `  ${fmt('sign-typed-data')}   <-- THE QUESTION\n` +
+    `  ${fmt('sign-message')}\n` +
+    `  ${fmt('send-transaction')}\n` +
+    `  ${fmt('wallet-auth')}\n` +
+    `\nMiniKit needs sign-typed-data v${1}. If the line above says NOT SUPPORTED,\n` +
+    `or omits version 1, that fully explains the hang - MiniKit marks commands\n` +
+    `available regardless and then waits forever for a reply that never comes.`,
     true
   );
   return true;
@@ -332,6 +359,24 @@ const TESTS = {
 
   T2: () => send('T2', [{ to: A.ROUTER, data: IROUTER.encodeFunctionData('pokeDynamic', [A.CURVE]) }]),
 
+};
+
+// MiniKit 2.0.3 has NO timeout in its command layer: nativeSignTypedData awaits
+// a promise that only ever resolves when World App fires the response event.
+// If the native side never answers, it pends forever - which is precisely what
+// happened on the first T6 run. A hang must be reported as TIMEOUT, never as a
+// signature failure.
+class TimeoutError extends Error {
+  constructor(ms) { super(`no response from World App after ${ms / 1000}s`); this.name = 'TimeoutError'; }
+}
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new TimeoutError(ms)), ms)),
+  ]);
+}
+
+const TESTS_CONT = {
   // ---- T6: signing bisection. Signs only. Sends nothing. ----------------
   //
   // WHY A LADDER RATHER THAN ONE PAYLOAD
@@ -358,14 +403,20 @@ const TESTS = {
       log.push('--- ' + name);
       emit(true);
       try {
-        const r = await fn();
+        const r = await withTimeout(fn(), 25000);
         const sig = (r?.data ?? r)?.signature;
         if (!sig) { log.push('    FAIL: no signature in response ' + JSON.stringify(r?.data ?? r)); return null; }
         log.push('    PASS  sig ' + sig.slice(0, 22) + '… (' + ((sig.length - 2) / 2) + ' bytes)');
         emit(true);
         return sig;
       } catch (e) {
-        log.push('    FAIL  ' + (e?.error_code || e?.code || e?.name || 'error') + ' — ' + (e?.message || ''));
+        if (e instanceof TimeoutError) {
+          log.push('    TIMEOUT  ' + e.message);
+          log.push('             No prompt, no callback, no error code.');
+          log.push('             This is a HANG, not a signature rejection.');
+        } else {
+          log.push('    FAIL  ' + (e?.error_code || e?.code || e?.name || 'error') + ' — ' + (e?.message || ''));
+        }
         return null;
       }
     };
@@ -510,6 +561,7 @@ const TESTS = {
   },
 
 };
+Object.assign(TESTS, TESTS_CONT);
 
 document.querySelectorAll('button[data-t]').forEach(b => {
   b.addEventListener('click', async () => {
