@@ -65,12 +65,15 @@
 </div>
 
 <div class="card">
-  <h2>T5 · ERC-1271 signature check <em>(FREE — signs only, sends NO transaction)</em></h2>
-  <p>Asks World App to sign an EIP-712 permit, then checks the signature against your wallet's own
-  <code>isValidSignature</code> with a read-only call. <b>No gas. No WLD. Nothing is broadcast.</b>
-  This decides whether an ERC-1271 permit SELL path is possible at all.</p>
-  <button data-t="T5">Run T5 (free)</button>
-  <div class="out" id="o-T5" hidden></div>
+  <h2>T6 · signing bisection <em>(FREE — signs only, sends NO transaction)</em></h2>
+  <p>Walks from the simplest possible signature up to our full permit and <b>stops at the first
+  failure</b>, so we learn exactly which field World App rejects.
+  <b>No gas. No WLD. Nothing broadcast.</b></p>
+  <p>You may see up to 6 signing prompts. <b>Approve each one.</b> If a prompt fails, the run stops
+  there and reports the culprit. If you deliberately cancel one, it will show
+  <code>user_rejected</code> and stop.</p>
+  <button data-t="T6">Run T6 (free)</button>
+  <div class="out" id="o-T6" hidden></div>
 </div>
 
 <div class="card" style="opacity:.55">
@@ -329,30 +332,131 @@ const TESTS = {
 
   T2: () => send('T2', [{ to: A.ROUTER, data: IROUTER.encodeFunctionData('pokeDynamic', [A.CURVE]) }]),
 
-  // ---- T5: ERC-1271 signature check. Signs only. Sends nothing. ----------
+  // ---- T6: signing bisection. Signs only. Sends nothing. ----------------
   //
-  // World App wallets are Gnosis Safe v1.4.1 (verified on-chain). A Safe's
-  // ERC-1271 does NOT validate a raw digest - it wraps it in its own EIP-712
-  // SafeMessage envelope. A fork test against this exact Safe confirmed:
-  //   signature over the RAW digest    -> REJECTED
-  //   signature over the WRAPPED hash  -> ACCEPTED
-  // So the only open question is which one MiniKit produces. This answers it
-  // for free, by asking the wallet itself.
-  T5: async () => {
+  // WHY A LADDER RATHER THAN ONE PAYLOAD
+  //
+  // T5 returned `generic_error`. The MiniKit 2.0.3 source shows the SDK does
+  // ZERO validation of signTypedData input - it forwards {types, primaryType,
+  // message, domain, chainId} verbatim to World App - so the error came from
+  // World App's own native signer, which is closed source.
+  //
+  // The SignTypedData error enum also contains `input_error` and
+  // `invalid_contract`, and we got NEITHER. So it is probably not a schema
+  // problem and probably not an allowlist rejection of verifyingContract.
+  // Beyond that, source reading cannot go further: only the device can.
+  //
+  // Each rung changes ONE thing from the rung below it.
+  T6: async () => {
     const who = addressNow();
-    if (!who) return show('T5', false, 'No wallet address yet.');
+    if (!who) return show('T6', false, 'No wallet address yet.');
 
-    const deadline = Math.floor(Date.now() / 1000) + 3600;
-    let nonce;
-    try {
-      nonce = ethers.toBigInt(await call(A.TOKEN, IERC20.encodeFunctionData('nonces', [who])));
-    } catch (e) {
-      return show('T5', false, 'could not read nonce: ' + e.message);
+    const log = [];
+    const emit = (ok) => show('T6', ok, log.join('\n'));
+
+    const step = async (name, fn) => {
+      log.push('--- ' + name);
+      emit(true);
+      try {
+        const r = await fn();
+        const sig = (r?.data ?? r)?.signature;
+        if (!sig) { log.push('    FAIL: no signature in response ' + JSON.stringify(r?.data ?? r)); return null; }
+        log.push('    PASS  sig ' + sig.slice(0, 22) + '… (' + ((sig.length - 2) / 2) + ' bytes)');
+        emit(true);
+        return sig;
+      } catch (e) {
+        log.push('    FAIL  ' + (e?.error_code || e?.code || e?.name || 'error') + ' — ' + (e?.message || ''));
+        return null;
+      }
+    };
+
+    const sign = (o) => MiniKit.signTypedData(o);
+
+    // Rung 0 - EIP-191. Does ANY signing work on this build?
+    const s0 = await step('0. signMessage (EIP-191, simplest possible)', () =>
+      MiniKit.signMessage({ message: 'probe' }));
+    if (!s0) {
+      log.push('');
+      log.push('STOP: even a plain message signature failed.');
+      log.push('Signing is broken on this build - this is NOT an ERC-1271 finding.');
+      return emit(false);
     }
 
-    // Exactly the permit a real launch token would ask for.
-    const domain = { name: 'ProbeToken', version: '1', chainId: 480, verifyingContract: A.TOKEN };
-    const types = {
+    // Rung 1 - the official docs example, verbatim.
+    const s1 = await step('1. docs example verbatim (Mail/contents, no verifyingContract)', () =>
+      sign({
+        chainId: 480,
+        primaryType: 'Mail',
+        domain: { name: 'Example', version: '1', chainId: 480 },
+        types: {
+          EIP712Domain: [
+            { name: 'name', type: 'string' },
+            { name: 'version', type: 'string' },
+            { name: 'chainId', type: 'uint256' },
+          ],
+          Mail: [{ name: 'contents', type: 'string' }],
+        },
+        message: { contents: 'Hello world' },
+      }));
+    if (!s1) {
+      log.push('');
+      log.push('STOP: the OFFICIAL DOCS EXAMPLE itself fails on this build.');
+      log.push('signTypedData is unusable here regardless of our payload.');
+      return emit(false);
+    }
+
+    // Rung 2 - same, but WITHOUT an explicit EIP712Domain entry in types.
+    const s2 = await step('2. docs example, EIP712Domain omitted from types', () =>
+      sign({
+        chainId: 480,
+        primaryType: 'Mail',
+        domain: { name: 'Example', version: '1', chainId: 480 },
+        types: { Mail: [{ name: 'contents', type: 'string' }] },
+        message: { contents: 'Hello world' },
+      }));
+
+    // Rung 3 - add verifyingContract to the domain (our dynamic token).
+    const s3 = await step('3. + verifyingContract = the DYNAMIC token', () =>
+      sign({
+        chainId: 480,
+        primaryType: 'Mail',
+        domain: { name: 'Example', version: '1', chainId: 480, verifyingContract: A.TOKEN },
+        types: {
+          EIP712Domain: [
+            { name: 'name', type: 'string' },
+            { name: 'version', type: 'string' },
+            { name: 'chainId', type: 'uint256' },
+            { name: 'verifyingContract', type: 'address' },
+          ],
+          Mail: [{ name: 'contents', type: 'string' }],
+        },
+        message: { contents: 'Hello world' },
+      }));
+
+    // Rung 4 - verifyingContract = WLD, which IS a known/listed token.
+    // Distinguishes "unknown contract" from "verifyingContract at all".
+    const s4 = await step('4. verifyingContract = WLD (a known token)', () =>
+      sign({
+        chainId: 480,
+        primaryType: 'Mail',
+        domain: { name: 'Example', version: '1', chainId: 480, verifyingContract: A.WLD },
+        types: {
+          EIP712Domain: [
+            { name: 'name', type: 'string' },
+            { name: 'version', type: 'string' },
+            { name: 'chainId', type: 'uint256' },
+            { name: 'verifyingContract', type: 'address' },
+          ],
+          Mail: [{ name: 'contents', type: 'string' }],
+        },
+        message: { contents: 'Hello world' },
+      }));
+
+    // Rung 5 - the real Permit struct: address + uint256 fields.
+    const nonce = ethers.toBigInt(await call(A.TOKEN, IERC20.encodeFunctionData('nonces', [who])));
+    const deadline = Math.floor(Date.now() / 1000) + 3600;
+    const permitDomain = { name: 'ProbeToken', version: '1', chainId: 480, verifyingContract: A.TOKEN };
+    const permitTypes = {
       Permit: [
         { name: 'owner', type: 'address' },
         { name: 'spender', type: 'address' },
@@ -361,21 +465,15 @@ const TESTS = {
         { name: 'deadline', type: 'uint256' },
       ],
     };
-    const message = {
+    const permitMessage = {
       owner: who, spender: A.ROUTER,
       value: AMT.toString(), nonce: nonce.toString(), deadline: String(deadline),
     };
-    // The digest an ERC-2612 token would build and hand to SignatureChecker.
-    const digest = ethers.TypedDataEncoder.hash(domain, types, message);
-
-    show('T5', true, 'requesting signature (no transaction will be sent)…');
-
-    let sig, raw;
-    try {
-      raw = await MiniKit.signTypedData({
+    const s5 = await step('5. full Permit (the T5 payload)', () =>
+      sign({
         chainId: 480,
         primaryType: 'Permit',
-        domain,
+        domain: permitDomain,
         types: {
           EIP712Domain: [
             { name: 'name', type: 'string' },
@@ -383,46 +481,34 @@ const TESTS = {
             { name: 'chainId', type: 'uint256' },
             { name: 'verifyingContract', type: 'address' },
           ],
-          ...types,
+          ...permitTypes,
         },
-        message,
-      });
-      sig = (raw?.data ?? raw)?.signature;
-    } catch (e) {
-      return show('T5', false, `SIGNING REFUSED\n\n${describeError(e)}`);
+        message: permitMessage,
+      }));
+
+    // If the permit signed, check it against the wallet's own ERC-1271.
+    if (s5) {
+      const digest = ethers.TypedDataEncoder.hash(permitDomain, permitTypes, permitMessage);
+      const I1271 = new ethers.Interface(['function isValidSignature(bytes32,bytes) view returns (bytes4)']);
+      log.push('--- ERC-1271 check on the permit signature');
+      log.push('    digest ' + digest);
+      try {
+        const ret = await call(who, I1271.encodeFunctionData('isValidSignature', [digest, s5]));
+        const [magic] = I1271.decodeFunctionResult('isValidSignature', ret);
+        log.push(magic === '0x1626ba7e'
+          ? '    PASS - wallet accepts it. ERC-1271 permit SELL is VIABLE.'
+          : '    FAIL - wallet returned ' + magic + ' (not the 0x1626ba7e magic value)');
+      } catch (e) {
+        log.push('    FAIL - isValidSignature reverted: ' + (e.shortMessage || e.message));
+        log.push('    (signature produced, but not Safe-wrapped for this digest)');
+      }
     }
-    if (!sig) return show('T5', false, `no signature returned\n${JSON.stringify(raw)}`);
 
-    // Ask the wallet itself whether that signature is valid for this digest.
-    const I1271 = new ethers.Interface(['function isValidSignature(bytes32,bytes) view returns (bytes4)']);
-    let verdict, ret;
-    try {
-      ret = await call(who, I1271.encodeFunctionData('isValidSignature', [digest, sig]));
-      const [magic] = I1271.decodeFunctionResult('isValidSignature', ret);
-      verdict = magic === '0x1626ba7e';
-    } catch (e) {
-      verdict = false;
-      ret = 'reverted: ' + (e.shortMessage || e.message);
-    }
-
-    const verdictText = verdict
-      ? 'PASS - the wallet accepts this signature for this digest.\n' +
-        'An ERC-1271-aware permit SELL path is VIABLE.'
-      : 'FAIL - the wallet does NOT accept it for this digest.\n' +
-        'MiniKit is not producing a Safe-wrapped signature for this envelope.';
-
-    show('T5', verdict, [
-      `wallet    : ${who}`,
-      `digest    : ${digest}`,
-      `signature : ${sig}`,
-      `sig bytes : ${(sig.length - 2) / 2}`,
-      `isValidSignature -> ${ret}`,
-      '',
-      verdictText,
-      '',
-      'NO TRANSACTION WAS SENT. No gas, no WLD.',
-    ].join('\n'));
+    log.push('');
+    log.push('NO TRANSACTION WAS SENT. No gas, no WLD.');
+    emit(Boolean(s5));
   },
+
 };
 
 document.querySelectorAll('button[data-t]').forEach(b => {
